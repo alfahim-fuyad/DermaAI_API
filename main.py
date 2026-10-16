@@ -1,7 +1,7 @@
 
 import os
 
-# Force TensorFlow to use CPU only.
+# Configure TensorFlow before importing it.
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -9,20 +9,24 @@ os.environ["TF_NUM_INTRAOP_THREADS"] = "1"
 os.environ["TF_NUM_INTEROP_THREADS"] = "1"
 
 import threading
+import logging
 from io import BytesIO
 
 import numpy as np
 import tensorflow as tf
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from huggingface_hub import hf_hub_download
+from PIL import Image, UnidentifiedImageError
+
+
+# Configure application logging.
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("dermachecker")
 
 # Explicitly disable GPU devices.
 tf.config.set_visible_devices([], "GPU")
 tf.config.threading.set_intra_op_parallelism_threads(1)
 tf.config.threading.set_inter_op_parallelism_threads(1)
-
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from huggingface_hub import hf_hub_download
-from PIL import Image, UnidentifiedImageError
-
 
 
 app = FastAPI(
@@ -32,23 +36,26 @@ app = FastAPI(
 
 REPO_ID = "fuyad07/dermacheckerbd-resnet50"
 MODEL_FILENAME = "resnet50_finetuned.keras"
+
 IMAGE_SIZE = 224
 MAX_IMAGE_SIZE = 10 * 1024 * 1024
 
 # IMPORTANT:
-# This order must exactly match the class-index order
-# used when the model was trained.
-CLASS_ORDER = os.getenv(
-    "CLASS_ORDER",
-    "akiec,bcc,bkl,df,mel,nv,vasc",
-).split(",")
+# This order must match the model's original training label order.
+CLASS_ORDER = [
+    label.strip()
+    for label in os.getenv(
+        "CLASS_ORDER",
+        "akiec,bcc,bkl,df,mel,nv,vasc",
+    ).split(",")
+]
 
 _model = None
 _model_lock = threading.Lock()
 
 
 def get_model():
-    """Download and load the model only once per process."""
+    """Download and load the model once per process."""
     global _model
 
     if _model is not None:
@@ -58,15 +65,23 @@ def get_model():
         if _model is not None:
             return _model
 
+        logger.info("STEP 1: Downloading model from Hugging Face.")
+
         model_path = hf_hub_download(
             repo_id=REPO_ID,
             filename=MODEL_FILENAME,
         )
 
+        logger.info("STEP 2: Model downloaded successfully.")
+
+        logger.info("STEP 3: Loading Keras model.")
+
         model = tf.keras.models.load_model(
             model_path,
             compile=False,
         )
+
+        logger.info("STEP 4: Keras model loaded.")
 
         input_shape = model.input_shape
         output_shape = model.output_shape
@@ -96,6 +111,13 @@ def get_model():
             )
 
         _model = model
+
+        logger.info(
+            "STEP 5: Model validated. Input=%s, output=%s",
+            input_shape,
+            output_shape,
+        )
+
         return _model
 
 
@@ -120,7 +142,9 @@ def health():
 async def predict(file: UploadFile = File(...)):
     """Predict the class of an uploaded skin-lesion image."""
 
-    # Validate content type when provided by the client.
+    logger.info("Prediction request received.")
+
+    # Validate file type.
     if (
         file.content_type
         and not file.content_type.startswith("image/")
@@ -130,6 +154,7 @@ async def predict(file: UploadFile = File(...)):
             detail="Please upload an image file.",
         )
 
+    # Read uploaded file.
     image_bytes = await file.read()
 
     if not image_bytes:
@@ -144,7 +169,7 @@ async def predict(file: UploadFile = File(...)):
             detail="Maximum image size is 10 MB.",
         )
 
-    # Decode and prepare the image.
+    # Decode and resize image.
     try:
         image = Image.open(
             BytesIO(image_bytes)
@@ -174,8 +199,10 @@ async def predict(file: UploadFile = File(...)):
             detail="Invalid image file.",
         )
 
-    # Run actual model inference.
+    # Run model inference.
     try:
+        logger.info("STEP A: Preparing image.")
+
         pixels = np.asarray(
             image,
             dtype=np.float32,
@@ -185,7 +212,11 @@ async def predict(file: UploadFile = File(...)):
             np.expand_dims(pixels, axis=0)
         )
 
+        logger.info("STEP B: Getting model.")
+
         model = get_model()
+
+        logger.info("STEP C: Running model inference.")
 
         raw = model(
             batch,
@@ -197,6 +228,8 @@ async def predict(file: UploadFile = File(...)):
             dtype=np.float32,
         )
 
+        logger.info("STEP D: Model inference completed.")
+
         if probabilities.shape != (
             1,
             len(CLASS_ORDER),
@@ -207,13 +240,12 @@ async def predict(file: UploadFile = File(...)):
 
         probabilities = probabilities[0]
 
-        # Check that the model output contains valid values.
         if not np.isfinite(probabilities).all():
             raise RuntimeError(
                 "Model returned non-finite values."
             )
 
-        # This endpoint expects a seven-class probability output.
+        # This endpoint expects a probability output.
         if np.any(probabilities < 0):
             raise RuntimeError(
                 "Model returned negative probability values."
@@ -226,7 +258,7 @@ async def predict(file: UploadFile = File(...)):
                 "Model returned an invalid probability total."
             )
 
-        # Normalize the output to sum to 1.
+        # Normalize output probabilities.
         probabilities = probabilities / total
 
         results = {
@@ -242,6 +274,11 @@ async def predict(file: UploadFile = File(...)):
             key=results.get,
         )
 
+        logger.info(
+            "Prediction completed. Class=%s",
+            predicted_class,
+        )
+
         return {
             "success": True,
             "backend": "keras",
@@ -255,7 +292,10 @@ async def predict(file: UploadFile = File(...)):
         raise
 
     except Exception:
-        # Avoid exposing internal server details to public clients.
+        logger.exception(
+            "Prediction failed due to an internal error."
+        )
+
         raise HTTPException(
             status_code=503,
             detail=(
