@@ -14,25 +14,50 @@ from io import BytesIO
 
 import numpy as np
 import tensorflow as tf
+
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from huggingface_hub import hf_hub_download
 from PIL import Image, UnidentifiedImageError
 
 
-# Configure application logging.
+# --------------------------------------------------
+# LOGGING
+# --------------------------------------------------
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dermachecker")
 
-# Explicitly disable GPU devices.
-tf.config.set_visible_devices([], "GPU")
-tf.config.threading.set_intra_op_parallelism_threads(1)
-tf.config.threading.set_inter_op_parallelism_threads(1)
 
+# --------------------------------------------------
+# TENSORFLOW CPU CONFIGURATION
+# --------------------------------------------------
+
+try:
+    tf.config.set_visible_devices([], "GPU")
+except RuntimeError:
+    logger.warning("GPU configuration was already initialized.")
+
+try:
+    tf.config.threading.set_intra_op_parallelism_threads(1)
+    tf.config.threading.set_inter_op_parallelism_threads(1)
+except RuntimeError:
+    logger.warning("TensorFlow threading was already initialized.")
+
+
+# --------------------------------------------------
+# FASTAPI APPLICATION
+# --------------------------------------------------
 
 app = FastAPI(
     title="DermaCheckerBD AI API",
     version="1.0.0",
+    description="ResNet50 skin lesion image classification API",
 )
+
+
+# --------------------------------------------------
+# MODEL CONFIGURATION
+# --------------------------------------------------
 
 REPO_ID = "fuyad07/dermacheckerbd-resnet50"
 MODEL_FILENAME = "resnet50_finetuned.keras"
@@ -41,7 +66,7 @@ IMAGE_SIZE = 224
 MAX_IMAGE_SIZE = 10 * 1024 * 1024
 
 # IMPORTANT:
-# This order must match the model's original training label order.
+# This order MUST match the original model training order.
 CLASS_ORDER = [
     label.strip()
     for label in os.getenv(
@@ -50,12 +75,20 @@ CLASS_ORDER = [
     ).split(",")
 ]
 
+if len(CLASS_ORDER) != 7 or len(set(CLASS_ORDER)) != 7:
+    raise RuntimeError("CLASS_ORDER must contain 7 unique classes.")
+
 _model = None
 _model_lock = threading.Lock()
 
 
+# --------------------------------------------------
+# LOAD MODEL
+# --------------------------------------------------
+
 def get_model():
     """Download and load the model once per process."""
+
     global _model
 
     if _model is not None:
@@ -67,21 +100,30 @@ def get_model():
 
         logger.info("STEP 1: Downloading model from Hugging Face.")
 
-        model_path = hf_hub_download(
-            repo_id=REPO_ID,
-            filename=MODEL_FILENAME,
-        )
+        try:
+            model_path = hf_hub_download(
+                repo_id=REPO_ID,
+                filename=MODEL_FILENAME,
+            )
+        except Exception:
+            logger.exception("STEP 1 FAILED: Model download failed.")
+            raise
 
         logger.info("STEP 2: Model downloaded successfully.")
+        logger.info("Model file path: %s", model_path)
 
-        logger.info("STEP 3: Loading Keras model.")
+        logger.info("STEP 3: BEFORE MODEL LOAD")
 
-        model = tf.keras.models.load_model(
-            model_path,
-            compile=False,
-        )
+        try:
+            model = tf.keras.models.load_model(
+                model_path,
+                compile=False,
+            )
+        except Exception:
+            logger.exception("STEP 3 FAILED: Keras model loading failed.")
+            raise
 
-        logger.info("STEP 4: Keras model loaded.")
+        logger.info("STEP 4: AFTER MODEL LOAD")
 
         input_shape = model.input_shape
         output_shape = model.output_shape
@@ -113,7 +155,8 @@ def get_model():
         _model = model
 
         logger.info(
-            "STEP 5: Model validated. Input=%s, output=%s",
+            "STEP 5: Model validated successfully. "
+            "Input=%s, Output=%s",
             input_shape,
             output_shape,
         )
@@ -121,13 +164,23 @@ def get_model():
         return _model
 
 
+# --------------------------------------------------
+# HOME ENDPOINT
+# --------------------------------------------------
+
 @app.get("/")
 def home():
     return {
         "service": "DermaCheckerBD AI API",
         "status": "running",
+        "model_loaded": _model is not None,
+        "docs": "/docs",
     }
 
+
+# --------------------------------------------------
+# HEALTH ENDPOINT
+# --------------------------------------------------
 
 @app.get("/health")
 def health():
@@ -138,13 +191,17 @@ def health():
     }
 
 
+# --------------------------------------------------
+# PREDICTION ENDPOINT
+# --------------------------------------------------
+
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
-    """Predict the class of an uploaded skin-lesion image."""
+    """Predict the class of an uploaded skin lesion image."""
 
     logger.info("Prediction request received.")
 
-    # Validate file type.
+    # Validate content type when supplied.
     if (
         file.content_type
         and not file.content_type.startswith("image/")
@@ -154,7 +211,7 @@ async def predict(file: UploadFile = File(...)):
             detail="Please upload an image file.",
         )
 
-    # Read uploaded file.
+    # Read the upload.
     image_bytes = await file.read()
 
     if not image_bytes:
@@ -171,15 +228,14 @@ async def predict(file: UploadFile = File(...)):
 
     # Decode and resize image.
     try:
-        image = Image.open(
-            BytesIO(image_bytes)
-        ).convert("RGB")
+        with Image.open(BytesIO(image_bytes)) as uploaded_image:
+            if uploaded_image.width < 16 or uploaded_image.height < 16:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Image dimensions must be at least 16x16 pixels.",
+                )
 
-        if image.width < 16 or image.height < 16:
-            raise HTTPException(
-                status_code=400,
-                detail="Image dimensions must be at least 16x16 pixels.",
-            )
+            image = uploaded_image.convert("RGB")
 
         image = image.resize(
             (IMAGE_SIZE, IMAGE_SIZE),
@@ -199,14 +255,11 @@ async def predict(file: UploadFile = File(...)):
             detail="Invalid image file.",
         )
 
-    # Run model inference.
+    # Run inference.
     try:
         logger.info("STEP A: Preparing image.")
 
-        pixels = np.asarray(
-            image,
-            dtype=np.float32,
-        )
+        pixels = np.asarray(image, dtype=np.float32)
 
         batch = tf.keras.applications.resnet50.preprocess_input(
             np.expand_dims(pixels, axis=0)
@@ -218,24 +271,17 @@ async def predict(file: UploadFile = File(...)):
 
         logger.info("STEP C: Running model inference.")
 
-        raw = model(
-            batch,
-            training=False,
-        )
+        raw = model(batch, training=False)
 
-        probabilities = np.asarray(
-            raw,
-            dtype=np.float32,
-        )
+        probabilities = np.asarray(raw, dtype=np.float32)
 
         logger.info("STEP D: Model inference completed.")
 
-        if probabilities.shape != (
-            1,
-            len(CLASS_ORDER),
-        ):
+        expected_shape = (1, len(CLASS_ORDER))
+
+        if probabilities.shape != expected_shape:
             raise RuntimeError(
-                "Model returned an unexpected output shape."
+                f"Unexpected model output shape: {probabilities.shape}"
             )
 
         probabilities = probabilities[0]
@@ -245,20 +291,24 @@ async def predict(file: UploadFile = File(...)):
                 "Model returned non-finite values."
             )
 
-        # This endpoint expects a probability output.
+        # This implementation expects probabilities,
+        # not raw logits.
         if np.any(probabilities < 0):
             raise RuntimeError(
-                "Model returned negative probability values."
+                "Model returned negative values; "
+                "verify whether the model outputs logits."
             )
 
         total = float(probabilities.sum())
 
-        if total <= 0:
+        if not np.isclose(total, 1.0, atol=0.02):
             raise RuntimeError(
-                "Model returned an invalid probability total."
+                "Model output does not appear to be a probability "
+                f"distribution. Sum={total:.6f}. "
+                "Check the final activation and model training code."
             )
 
-        # Normalize output probabilities.
+        # Small floating-point differences are normalized.
         probabilities = probabilities / total
 
         results = {
@@ -269,14 +319,12 @@ async def predict(file: UploadFile = File(...)):
             )
         }
 
-        predicted_class = max(
-            results,
-            key=results.get,
-        )
+        predicted_class = max(results, key=results.get)
 
         logger.info(
-            "Prediction completed. Class=%s",
+            "Prediction completed. Class=%s, Confidence=%.6f",
             predicted_class,
+            results[predicted_class],
         )
 
         return {
@@ -303,3 +351,6 @@ async def predict(file: UploadFile = File(...)):
                 "unavailable. Please try again later."
             ),
         )
+
+    finally:
+        await file.close()
