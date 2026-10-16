@@ -1,7 +1,6 @@
 
-fastapi
-uvicorn[standard]
+fastapi[standard]
 tensorflow
 pillow
 huggingface_hub
-python-multipart
+numpy
