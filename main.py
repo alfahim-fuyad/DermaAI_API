@@ -1,19 +1,28 @@
 
 import os
 
-# Configure TensorFlow before importing it.
-# This API will use CPU instead of attempting GPU initialization.
+# Force TensorFlow to use CPU only.
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["TF_NUM_INTRAOP_THREADS"] = "1"
+os.environ["TF_NUM_INTEROP_THREADS"] = "1"
 
 import threading
 from io import BytesIO
 
 import numpy as np
 import tensorflow as tf
+
+# Explicitly disable GPU devices.
+tf.config.set_visible_devices([], "GPU")
+tf.config.threading.set_intra_op_parallelism_threads(1)
+tf.config.threading.set_inter_op_parallelism_threads(1)
+
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from huggingface_hub import hf_hub_download
 from PIL import Image, UnidentifiedImageError
+
 
 
 app = FastAPI(
