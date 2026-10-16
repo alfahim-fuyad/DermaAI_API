@@ -1,0 +1,15 @@
+
+[project]
+name = "dermachecker-ai-api"
+version = "1.0.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi[standard]",
+    "tensorflow==2.20.0",
+    "pillow",
+    "huggingface_hub",
+    "numpy",
+]
+
+[tool.fastapi]
+entrypoint = "main:app"
