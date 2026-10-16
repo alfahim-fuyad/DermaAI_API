@@ -1,6 +1,6 @@
 
 fastapi[standard]
-tensorflow
+tensorflow==2.20.0
 pillow
 huggingface_hub
 numpy
